@@ -591,6 +591,7 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     chat_type = update.effective_chat.type if update.effective_chat else ""
+    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
     app = context.application
     client: Anthropic = app.bot_data["llm_client"]
     model: str = app.bot_data["llm_model"]
@@ -598,6 +599,11 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     target_chat_id: str | None = app.bot_data.get("target_chat_id")
     llm_timeout_seconds: int = app.bot_data.get("llm_timeout_seconds", 60)
     bot_username = context.bot.username
+    allowed_group_id: str | None = app.bot_data.get("allowed_group_id")
+
+    # Restrict bot activity to a single configured group; private chat stays enabled.
+    if chat_type != "private" and allowed_group_id and chat_id != allowed_group_id:
+        return
 
     if chat_type != "private":
         if not is_reply_bot_trigger(update, bot_username):
@@ -760,6 +766,7 @@ def main() -> None:
     claude_model = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
     timezone_name = os.getenv("BOT_TIMEZONE", "Asia/Tashkent")
     target_chat_id = os.getenv("TARGET_CHAT_ID")
+    allowed_group_id = os.getenv("ALLOWED_GROUP_ID")
     source_urls = parse_source_urls(os.getenv("SOURCE_URLS"))
     auto_scan_interval_minutes = int(os.getenv("AUTO_SCAN_INTERVAL_MINUTES", "0"))
     llm_timeout_seconds = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
@@ -779,6 +786,7 @@ def main() -> None:
     application.bot_data["llm_model"] = claude_model
     application.bot_data["tz"] = tz
     application.bot_data["target_chat_id"] = target_chat_id
+    application.bot_data["allowed_group_id"] = allowed_group_id
     application.bot_data["source_urls"] = source_urls
     application.bot_data["llm_timeout_seconds"] = llm_timeout_seconds
     application.bot_data["max_candidates_per_source"] = max_candidates_per_source

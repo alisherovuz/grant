@@ -48,6 +48,7 @@ Railway'da yangi service oching va repo ulang.
 - `CLAUDE_API_KEY` (yoki `ANTHROPIC_API_KEY`)
 - `CLAUDE_MODEL` (masalan `claude-3-5-sonnet-latest`)
 - `TARGET_CHAT_ID` (masalan `-1001234567890`)
+- `ALLOWED_GROUP_ID` (bot faqat shu guruhda ishlaydi, masalan `-1001234567890`)
 - `BOT_TIMEZONE` (`Asia/Tashkent`)
 - `SOURCE_URLS` (vergul yoki yangi qatorda source linklar)
 - `AUTO_SCAN_INTERVAL_MINUTES` (masalan `60`, `0` bo'lsa auto off)
@@ -100,3 +101,7 @@ Imlo tekshiruvi:
 Reply orqali grant post:
 - Groupda link bor xabarga reply qiling va botni tag qiling (yoki `/grant` bilan reply qiling).
 - Bot o'sha linkni ochib, mos bo'lsa grant postni tayyorlab beradi.
+
+Guruh cheklovi:
+- `ALLOWED_GROUP_ID` qo'ysangiz, bot faqat o'sha bitta guruhda ishlaydi.
+- Private chat funksiyalari (bot bilan shaxsiy chat) ishlashda davom etadi.
