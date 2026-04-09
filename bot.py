@@ -185,13 +185,8 @@ def build_duty_message(
     duty_date: datetime,
     duty_names: list[str],
     username_map: dict[str, str],
-    monthly_schedule: dict[int, list[str]],
 ) -> str:
     mentions = [username_map.get(name, name) for name in duty_names]
-    counts: dict[str, int] = {}
-    for names in monthly_schedule.values():
-        for nm in names:
-            counts[nm] = counts.get(nm, 0) + 1
 
     day_label = duty_date.strftime("%d-%m-%Y")
     lines = [
@@ -201,13 +196,6 @@ def build_duty_message(
         "",
     ]
     lines.extend(mentions or ["(username topilmadi)"])
-    lines.append("")
-    lines.append("Oy bo'yicha postlar soni:")
-    if counts:
-        for name in sorted(counts.keys()):
-            lines.append(f"{name} - {counts[name]}")
-    else:
-        lines.append("Schedule kiritilmagan")
 
     return "\n".join(lines)
 
@@ -367,6 +355,19 @@ def format_group_message(result: EvaluationResult, source_url: str, from_user: s
     return text, None
 
 
+def is_reply_spellcheck_request(update: Update, bot_username: str | None) -> bool:
+    if not update.message or not update.message.reply_to_message:
+        return False
+    text = (update.message.text or "").strip().lower()
+    if not text:
+        return False
+
+    bot_tag = f"@{bot_username.lower()}" if bot_username else ""
+    if text.startswith("/spell"):
+        return True
+    return bool(bot_tag and bot_tag in text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Opportunity matnini yuboring. Bot uni tekshiradi va natijani private guruhga jo'natadi.\n\n"
@@ -417,7 +418,6 @@ async def duty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         duty_date=now,
         duty_names=duty_names,
         username_map=member_usernames,
-        monthly_schedule=monthly_schedule,
     )
     await update.message.reply_text(msg)
 
@@ -443,7 +443,6 @@ async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         duty_date=now,
         duty_names=duty_names,
         username_map=member_usernames,
-        monthly_schedule=monthly_schedule,
     )
     await context.bot.send_message(chat_id=target_chat_id, text=text)
 
@@ -459,7 +458,6 @@ async def run_source_scan(context: ContextTypes.DEFAULT_TYPE, notify_chat_id: in
     llm_timeout_seconds: int = app.bot_data.get("llm_timeout_seconds", 60)
     max_candidates_per_source: int = app.bot_data.get("max_candidates_per_source", 8)
     scan_max_evaluations: int = app.bot_data.get("scan_max_evaluations", 20)
-    enable_spellcheck: bool = app.bot_data.get("enable_spellcheck", True)
     scan_lock: asyncio.Lock = app.bot_data["scan_lock"]
 
     if scan_lock.locked():
@@ -539,21 +537,6 @@ async def run_source_scan(context: ContextTypes.DEFAULT_TYPE, notify_chat_id: in
                     continue
 
                 if result.eligible and destination_chat_id:
-                    proof = SpellcheckResult(changed=False, corrected_post=result.post, notes=[])
-                    if enable_spellcheck:
-                        try:
-                            proof = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    spellcheck_post,
-                                    client,
-                                    model,
-                                    result.post,
-                                ),
-                                timeout=llm_timeout_seconds,
-                            )
-                        except Exception as exc:
-                            logger.warning("Spellcheck skip: %s", exc)
-
                     stats.eligible_total += 1
                     try:
                         await context.bot.send_message(
@@ -567,15 +550,7 @@ async def run_source_scan(context: ContextTypes.DEFAULT_TYPE, notify_chat_id: in
                         )
                         await context.bot.send_message(
                             chat_id=destination_chat_id,
-                            text=(
-                                "Imlo tekshiruvi: "
-                                + ("xatolar tuzatildi" if proof.changed else "xato topilmadi")
-                                + (f"\nIzoh: {'; '.join(proof.notes)}" if proof.notes else "")
-                            ),
-                        )
-                        await context.bot.send_message(
-                            chat_id=destination_chat_id,
-                            text=proof.corrected_post,
+                            text=result.post,
                             disable_web_page_preview=True,
                         )
                     except Exception as exc:
@@ -618,19 +593,54 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.message or not update.message.text:
         return
 
-    text = update.message.text.strip()
-    if not text:
-        return
-
-    await update.message.reply_text("Tahlil boshlandi...")
-
+    chat_type = update.effective_chat.type if update.effective_chat else ""
     app = context.application
     client: Anthropic = app.bot_data["llm_client"]
     model: str = app.bot_data["llm_model"]
     tz: ZoneInfo = app.bot_data["tz"]
     target_chat_id: str | None = app.bot_data.get("target_chat_id")
     llm_timeout_seconds: int = app.bot_data.get("llm_timeout_seconds", 60)
-    enable_spellcheck: bool = app.bot_data.get("enable_spellcheck", True)
+    bot_username = context.bot.username
+
+    if chat_type != "private":
+        if not is_reply_spellcheck_request(update, bot_username):
+            return
+
+        replied = update.message.reply_to_message
+        original_text = (replied.text or replied.caption or "").strip() if replied else ""
+        if not original_text:
+            await update.message.reply_text("Iltimos, matnli xabarga reply qilib tekshiring.")
+            return
+
+        await update.message.reply_text("Imlo tekshiruvi boshlandi...")
+        try:
+            proof = await asyncio.wait_for(
+                asyncio.to_thread(
+                    spellcheck_post,
+                    client,
+                    model,
+                    original_text,
+                ),
+                timeout=llm_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning("Reply spellcheck xatoligi: %s", exc)
+            await update.message.reply_text(f"Imlo tekshiruvda xatolik: {exc}")
+            return
+
+        await update.message.reply_text(
+            "Natija: "
+            + ("xatolar tuzatildi" if proof.changed else "xato topilmadi")
+            + (f"\nIzoh: {'; '.join(proof.notes)}" if proof.notes else "")
+            + f"\n\n{proof.corrected_post}"
+        )
+        return
+
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    await update.message.reply_text("Tahlil boshlandi...")
 
     source_url = extract_first_url(text)
     today = datetime.now(tz).date().isoformat()
@@ -676,27 +686,6 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"Sabab: {result.reason or '—'}"
     )
 
-    proof = SpellcheckResult(changed=False, corrected_post=result.post, notes=[])
-    if result.eligible and enable_spellcheck:
-        try:
-            proof = await asyncio.wait_for(
-                asyncio.to_thread(
-                    spellcheck_post,
-                    client,
-                    model,
-                    result.post,
-                ),
-                timeout=llm_timeout_seconds,
-            )
-            await update.message.reply_text(
-                "Imlo tekshiruvi: "
-                + ("xatolar tuzatildi" if proof.changed else "xato topilmadi")
-                + (f"\nIzoh: {'; '.join(proof.notes)}" if proof.notes else "")
-            )
-        except Exception as exc:
-            logger.warning("Imlo tekshiruvi xatoligi: %s", exc)
-            await update.message.reply_text("Imlo tekshiruv vaqtida xatolik bo'ldi, original post ishlatiladi.")
-
     if target_chat_id:
         from_user = update.effective_user.full_name if update.effective_user else "Noma'lum"
         group_message, _ = format_group_message(result, source_url, from_user)
@@ -712,15 +701,7 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if result.eligible:
                 await context.bot.send_message(
                     chat_id=target_chat_id,
-                    text=(
-                        "Imlo tekshiruvi: "
-                        + ("xatolar tuzatildi" if proof.changed else "xato topilmadi")
-                        + (f"\nIzoh: {'; '.join(proof.notes)}" if proof.notes else "")
-                    ),
-                )
-                await context.bot.send_message(
-                    chat_id=target_chat_id,
-                    text=proof.corrected_post,
+                    text=result.post,
                     disable_web_page_preview=True,
                 )
 
@@ -745,7 +726,6 @@ def main() -> None:
     llm_timeout_seconds = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
     max_candidates_per_source = int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "8"))
     scan_max_evaluations = int(os.getenv("SCAN_MAX_EVALUATIONS", "20"))
-    enable_spellcheck = os.getenv("ENABLE_SPELLCHECK", "1").strip().lower() not in {"0", "false", "no"}
     monthly_schedule = parse_monthly_schedule(os.getenv("MONTHLY_SCHEDULE"))
     member_usernames = parse_member_usernames(os.getenv("MEMBER_USERNAMES"))
     daily_reminder_hour = int(os.getenv("DAILY_REMINDER_HOUR", "9"))
@@ -766,7 +746,6 @@ def main() -> None:
     application.bot_data["scan_max_evaluations"] = scan_max_evaluations
     application.bot_data["scan_lock"] = asyncio.Lock()
     application.bot_data["auto_scan_interval_minutes"] = auto_scan_interval_minutes
-    application.bot_data["enable_spellcheck"] = enable_spellcheck
     application.bot_data["monthly_schedule"] = monthly_schedule
     application.bot_data["member_usernames"] = member_usernames
     application.bot_data["daily_reminder_hour"] = daily_reminder_hour
@@ -803,11 +782,10 @@ def main() -> None:
             )
 
     logger.info(
-        "Bot ishga tushdi | source_urls=%s | auto_scan_interval_minutes=%s | schedule_days=%s | spellcheck=%s",
+        "Bot ishga tushdi | source_urls=%s | auto_scan_interval_minutes=%s | schedule_days=%s",
         len(source_urls),
         auto_scan_interval_minutes,
         len(monthly_schedule),
-        enable_spellcheck,
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -54,7 +54,6 @@ Railway'da yangi service oching va repo ulang.
 - `LLM_TIMEOUT_SECONDS` (masalan `60`)
 - `MAX_CANDIDATES_PER_SOURCE` (masalan `8`)
 - `SCAN_MAX_EVALUATIONS` (masalan `20`)
-- `ENABLE_SPELLCHECK` (`1` yoki `0`)
 - `MONTHLY_SCHEDULE` (masalan `1:Botirjon,Nargiza;2:Elbek,Muattar`)
 - `MEMBER_USERNAMES` (masalan `Botirjon=@botirjon_uz,Nargiza=@nargiza_uz`)
 - `DAILY_REMINDER_HOUR` (masalan `9`)
@@ -94,5 +93,6 @@ Schedule format:
 - `MEMBER_USERNAMES`: `Ism=@username` ko'rinishida yoziladi
 
 Imlo tekshiruvi:
-- Eligible post yuborilishidan oldin bot avtomatik imlo tekshiradi.
-- Natija alohida xabar bo'lib chiqadi: `xatolar tuzatildi` yoki `xato topilmadi`.
+- Bot faqat siz xabarga `reply` qilib botni `@username` bilan tag qilganingizda tekshiradi.
+- Yoki `/spell` komandasi bilan reply qilsangiz ham ishlaydi.
+- Oddiy group discussion xabarlari tekshirilmaydi.
