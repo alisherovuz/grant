@@ -469,12 +469,18 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_message))
 
     if auto_scan_interval_minutes > 0:
-        application.job_queue.run_repeating(
-            auto_scan_job,
-            interval=auto_scan_interval_minutes * 60,
-            first=20,
-            name="auto-source-scan",
-        )
+        if application.job_queue is None:
+            logger.warning(
+                "JobQueue topilmadi. Auto scan o'chirildi. "
+                "python-telegram-bot[job-queue] o'rnatilganini tekshiring."
+            )
+        else:
+            application.job_queue.run_repeating(
+                auto_scan_job,
+                interval=auto_scan_interval_minutes * 60,
+                first=20,
+                name="auto-source-scan",
+            )
 
     logger.info(
         "Bot ishga tushdi | source_urls=%s | auto_scan_interval_minutes=%s",
