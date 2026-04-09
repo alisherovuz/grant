@@ -80,10 +80,10 @@ URL rejimi:
 - Agar sayt himoyalangan bo'lsa yoki matn ajralmasa, bot siz yuborgan matn bilan davom etadi.
 
 Auto source rejimi:
-- `/scan` komandasi: source URL'lardan darhol bir martalik scan qiladi.
+- `/scan` hozir ataylab o'chirilgan (token tejash uchun).
 - `/status` komandasi: bot bandmi (`busy`) yoki bo'shmi (`idle`) ko'rsatadi.
 - `/duty` komandasi: bugungi navbatchilar va username mentionlarni ko'rsatadi.
-- `AUTO_SCAN_INTERVAL_MINUTES>0` bo'lsa bot periodik scan ham qiladi.
+- Auto-scan yo'q: bot faqat qo'lda trigger bo'lganda ishlaydi.
 - Avval tekshirilgan linklar `seen_links.json` fayliga yoziladi, qayta yubormaydi.
 - Uzoq ishlash va xarajatni boshqarish uchun limit env'lardan foydalaning.
 
@@ -96,3 +96,7 @@ Imlo tekshiruvi:
 - Bot faqat siz xabarga `reply` qilib botni `@username` bilan tag qilganingizda tekshiradi.
 - Yoki `/spell` komandasi bilan reply qilsangiz ham ishlaydi.
 - Oddiy group discussion xabarlari tekshirilmaydi.
+
+Reply orqali grant post:
+- Groupda link bor xabarga reply qiling va botni tag qiling (yoki `/grant` bilan reply qiling).
+- Bot o'sha linkni ochib, mos bo'lsa grant postni tayyorlab beradi.

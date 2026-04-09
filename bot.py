@@ -368,6 +368,18 @@ def is_reply_spellcheck_request(update: Update, bot_username: str | None) -> boo
     return bool(bot_tag and bot_tag in text)
 
 
+def is_reply_bot_trigger(update: Update, bot_username: str | None) -> bool:
+    if not update.message or not update.message.reply_to_message:
+        return False
+    text = (update.message.text or "").strip().lower()
+    if not text:
+        return False
+    if text.startswith("/spell") or text.startswith("/grant"):
+        return True
+    bot_tag = f"@{bot_username.lower()}" if bot_username else ""
+    return bool(bot_tag and bot_tag in text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Opportunity matnini yuboring. Bot uni tekshiradi va natijani private guruhga jo'natadi.\n\n"
@@ -386,7 +398,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     scan_state = "busy (scan ketmoqda)" if scan_lock.locked() else "idle"
     auto_scan_state = (
-        f"yoqilgan ({auto_scan_interval_minutes} daqiqada 1 marta)"
+        f"o'chirilgan (oldingi sozlama: {auto_scan_interval_minutes} daqiqa)"
         if auto_scan_interval_minutes > 0
         else "o'chirilgan"
     )
@@ -564,29 +576,14 @@ async def run_source_scan(context: ContextTypes.DEFAULT_TYPE, notify_chat_id: in
 
 
 async def scan_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-
-    await update.message.reply_text("Source scan boshlandi...")
-    stats = await run_source_scan(context=context, notify_chat_id=update.effective_chat.id)
-    await update.message.reply_text(
-        "Scan tugadi.\n"
-        f"Manbalar: {stats.sources_total}\n"
-        f"Topilgan kandidatlar: {stats.candidates_total}\n"
-        f"Tekshirilganlar: {stats.checked_total}\n"
-        f"Eligible: {stats.eligible_total}"
-    )
+    if update.message:
+        await update.message.reply_text(
+            "/scan o'chirilgan (token tejash uchun). Endi link xabarga reply + bot tag qilsangiz ishlaydi."
+        )
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    stats = await run_source_scan(context=context)
-    logger.info(
-        "Auto-scan done | sources=%s candidates=%s checked=%s eligible=%s",
-        stats.sources_total,
-        stats.candidates_total,
-        stats.checked_total,
-        stats.eligible_total,
-    )
+    logger.info("Auto-scan o'chirilgan")
 
 
 async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -603,13 +600,55 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     bot_username = context.bot.username
 
     if chat_type != "private":
-        if not is_reply_spellcheck_request(update, bot_username):
+        if not is_reply_bot_trigger(update, bot_username):
             return
 
         replied = update.message.reply_to_message
         original_text = (replied.text or replied.caption or "").strip() if replied else ""
         if not original_text:
             await update.message.reply_text("Iltimos, matnli xabarga reply qilib tekshiring.")
+            return
+
+        replied_url = extract_first_url(original_text)
+        if replied_url != "Noma'lum":
+            await update.message.reply_text("Reply qilingan link uchun grant post tayyorlanmoqda...")
+            today = datetime.now(tz).date().isoformat()
+            raw_text_for_ai = original_text
+            try:
+                fetched_text = await asyncio.wait_for(
+                    asyncio.to_thread(fetch_url_content, replied_url),
+                    timeout=30,
+                )
+                if fetched_text:
+                    raw_text_for_ai = f"{original_text}\n\nQuyida URLdan olingan matn:\n{fetched_text}"
+            except Exception as exc:
+                logger.warning("Reply link fetch xatoligi: %s", exc)
+
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        evaluate_opportunity,
+                        client,
+                        model,
+                        today,
+                        replied_url,
+                        raw_text_for_ai,
+                    ),
+                    timeout=llm_timeout_seconds,
+                )
+            except Exception as exc:
+                await update.message.reply_text(f"Grant post yaratishda xatolik: {exc}")
+                return
+
+            if result.eligible:
+                await update.message.reply_text(
+                    "Tayyor post:\n\n" + result.post,
+                    disable_web_page_preview=True,
+                )
+            else:
+                await update.message.reply_text(
+                    f"Bu imkoniyat mos emas.\nSabab: {result.reason}"
+                )
             return
 
         await update.message.reply_text("Imlo tekshiruvi boshlandi...")
@@ -758,18 +797,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_message))
 
     if auto_scan_interval_minutes > 0:
-        if application.job_queue is None:
-            logger.warning(
-                "JobQueue topilmadi. Auto scan o'chirildi. "
-                "python-telegram-bot[job-queue] o'rnatilganini tekshiring."
-            )
-        else:
-            application.job_queue.run_repeating(
-                auto_scan_job,
-                interval=auto_scan_interval_minutes * 60,
-                first=20,
-                name="auto-source-scan",
-            )
+        logger.info("AUTO_SCAN_INTERVAL_MINUTES=%s lekin auto-scan ataylab o'chirilgan", auto_scan_interval_minutes)
 
     if monthly_schedule:
         if application.job_queue is None:
