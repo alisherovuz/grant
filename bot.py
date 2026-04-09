@@ -2,9 +2,10 @@ import json
 import logging
 import os
 import re
+import asyncio
 from html import escape
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
@@ -27,6 +28,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("edugrands-bot")
 SEEN_LINKS_FILE = "seen_links.json"
+SPELLCHECK_SYSTEM_PROMPT = """You are an Uzbek Latin spelling and grammar editor.
+You will receive one Telegram post text.
+Task:
+1) Fix only spelling, punctuation, and minor grammar issues.
+2) Keep original meaning unchanged.
+3) Preserve structure, markdown, emojis, line breaks, bullets, and links.
+4) Do not add new facts.
+Return JSON only:
+{
+  "changed": true or false,
+  "corrected_post": "full corrected text",
+  "notes": ["short note 1", "short note 2"]
+}
+"""
 
 
 @dataclass
@@ -42,6 +57,13 @@ class ScanStats:
     candidates_total: int = 0
     checked_total: int = 0
     eligible_total: int = 0
+
+
+@dataclass
+class SpellcheckResult:
+    changed: bool
+    corrected_post: str
+    notes: list[str]
 
 
 def get_required_env(key: str) -> str:
@@ -118,6 +140,76 @@ def parse_source_urls(raw: str | None) -> list[str]:
         if item.startswith("http://") or item.startswith("https://"):
             urls.append(item)
     return list(dict.fromkeys(urls))
+
+
+def parse_monthly_schedule(raw: str | None) -> dict[int, list[str]]:
+    schedule: dict[int, list[str]] = {}
+    if not raw:
+        return schedule
+
+    lines = [ln.strip() for ln in re.split(r"[;\n]+", raw) if ln.strip()]
+    for line in lines:
+        match = re.match(r"^\s*(\d{1,2})\s*[:=-]\s*(.+)$", line)
+        if not match:
+            continue
+        day = int(match.group(1))
+        if day < 1 or day > 31:
+            continue
+        names = [n.strip() for n in match.group(2).split(",") if n.strip()]
+        if names:
+            schedule[day] = names
+    return schedule
+
+
+def parse_member_usernames(raw: str | None) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if not raw:
+        return mapping
+
+    pairs = [p.strip() for p in re.split(r"[;\n,]+", raw) if p.strip()]
+    for pair in pairs:
+        if "=" not in pair:
+            continue
+        name, username = pair.split("=", 1)
+        n = name.strip()
+        u = username.strip()
+        if not n or not u:
+            continue
+        if not u.startswith("@"):
+            u = f"@{u}"
+        mapping[n] = u
+    return mapping
+
+
+def build_duty_message(
+    duty_date: datetime,
+    duty_names: list[str],
+    username_map: dict[str, str],
+    monthly_schedule: dict[int, list[str]],
+) -> str:
+    mentions = [username_map.get(name, name) for name in duty_names]
+    counts: dict[str, int] = {}
+    for names in monthly_schedule.values():
+        for nm in names:
+            counts[nm] = counts.get(nm, 0) + 1
+
+    day_label = duty_date.strftime("%d-%m-%Y")
+    lines = [
+        "Bugungi navbatchilar:",
+        f"Sana: {day_label}",
+        ", ".join(duty_names),
+        "",
+    ]
+    lines.extend(mentions or ["(username topilmadi)"])
+    lines.append("")
+    lines.append("Oy bo'yicha postlar soni:")
+    if counts:
+        for name in sorted(counts.keys()):
+            lines.append(f"{name} - {counts[name]}")
+    else:
+        lines.append("Schedule kiritilmagan")
+
+    return "\n".join(lines)
 
 
 def extract_candidate_links(source_url: str, html: str, max_links: int = 20) -> list[str]:
@@ -227,6 +319,33 @@ def evaluate_opportunity(client: Anthropic, model: str, today: str, source_url: 
     return EvaluationResult(eligible=eligible, reason=reason, post=post)
 
 
+def spellcheck_post(client: Anthropic, model: str, post_text: str) -> SpellcheckResult:
+    response = client.messages.create(
+        model=model,
+        system=SPELLCHECK_SYSTEM_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": post_text,
+            }
+        ],
+        max_tokens=2200,
+        temperature=0,
+    )
+
+    parts: list[str] = []
+    for block in response.content:
+        if getattr(block, "type", "") == "text":
+            parts.append(getattr(block, "text", ""))
+
+    parsed = safe_json_extract("\n".join(parts).strip())
+    changed = bool(parsed.get("changed", False))
+    corrected_post = str(parsed.get("corrected_post", "") or "").strip() or post_text
+    notes_raw = parsed.get("notes", [])
+    notes = [str(x).strip() for x in notes_raw] if isinstance(notes_raw, list) else []
+    return SpellcheckResult(changed=changed, corrected_post=corrected_post, notes=notes[:3])
+
+
 def format_group_message(result: EvaluationResult, source_url: str, from_user: str) -> tuple[str, str | None]:
     safe_url = escape(source_url)
     safe_user = escape(from_user)
@@ -256,6 +375,79 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    scan_lock: asyncio.Lock = context.application.bot_data["scan_lock"]
+    source_urls: list[str] = context.application.bot_data.get("source_urls", [])
+    auto_scan_interval_minutes = int(context.application.bot_data.get("auto_scan_interval_minutes", 0))
+
+    scan_state = "busy (scan ketmoqda)" if scan_lock.locked() else "idle"
+    auto_scan_state = (
+        f"yoqilgan ({auto_scan_interval_minutes} daqiqada 1 marta)"
+        if auto_scan_interval_minutes > 0
+        else "o'chirilgan"
+    )
+
+    await update.message.reply_text(
+        "Bot holati:\n"
+        f"- Scan: {scan_state}\n"
+        f"- Source soni: {len(source_urls)}\n"
+        f"- Auto scan: {auto_scan_state}"
+    )
+
+
+async def duty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    app = context.application
+    tz: ZoneInfo = app.bot_data["tz"]
+    monthly_schedule: dict[int, list[str]] = app.bot_data.get("monthly_schedule", {})
+    member_usernames: dict[str, str] = app.bot_data.get("member_usernames", {})
+    now = datetime.now(tz)
+    duty_names = monthly_schedule.get(now.day, [])
+
+    if not duty_names:
+        await update.message.reply_text("Bugungi sana uchun navbatchi schedule topilmadi.")
+        return
+
+    msg = build_duty_message(
+        duty_date=now,
+        duty_names=duty_names,
+        username_map=member_usernames,
+        monthly_schedule=monthly_schedule,
+    )
+    await update.message.reply_text(msg)
+
+
+async def daily_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    tz: ZoneInfo = app.bot_data["tz"]
+    target_chat_id: str | None = app.bot_data.get("target_chat_id")
+    monthly_schedule: dict[int, list[str]] = app.bot_data.get("monthly_schedule", {})
+    member_usernames: dict[str, str] = app.bot_data.get("member_usernames", {})
+
+    if not target_chat_id:
+        logger.warning("Daily reminder skip: TARGET_CHAT_ID yo'q")
+        return
+
+    now = datetime.now(tz)
+    duty_names = monthly_schedule.get(now.day, [])
+    if not duty_names:
+        logger.info("Daily reminder: schedule yo'q (%s)", now.day)
+        return
+
+    text = build_duty_message(
+        duty_date=now,
+        duty_names=duty_names,
+        username_map=member_usernames,
+        monthly_schedule=monthly_schedule,
+    )
+    await context.bot.send_message(chat_id=target_chat_id, text=text)
+
+
 async def run_source_scan(context: ContextTypes.DEFAULT_TYPE, notify_chat_id: int | None = None) -> ScanStats:
     app = context.application
     client: Anthropic = app.bot_data["llm_client"]
@@ -264,76 +456,136 @@ async def run_source_scan(context: ContextTypes.DEFAULT_TYPE, notify_chat_id: in
     source_urls: list[str] = app.bot_data.get("source_urls", [])
     target_chat_id: str | None = app.bot_data.get("target_chat_id")
     destination_chat_id = str(notify_chat_id) if notify_chat_id is not None else target_chat_id
+    llm_timeout_seconds: int = app.bot_data.get("llm_timeout_seconds", 60)
+    max_candidates_per_source: int = app.bot_data.get("max_candidates_per_source", 8)
+    scan_max_evaluations: int = app.bot_data.get("scan_max_evaluations", 20)
+    enable_spellcheck: bool = app.bot_data.get("enable_spellcheck", True)
+    scan_lock: asyncio.Lock = app.bot_data["scan_lock"]
 
-    stats = ScanStats(sources_total=len(source_urls))
-    if not source_urls:
+    if scan_lock.locked():
         if destination_chat_id:
             await context.bot.send_message(
                 chat_id=destination_chat_id,
-                text="SOURCE_URLS bo'sh. .env da manbalarni kiriting.",
+                text="Scan allaqachon ishlayapti. Tugashini kuting.",
             )
-        return stats
+        return ScanStats(sources_total=len(source_urls))
 
-    seen_links = load_seen_links()
-    today = datetime.now(tz).date().isoformat()
+    await scan_lock.acquire()
+    try:
+        stats = ScanStats(sources_total=len(source_urls))
+        if not source_urls:
+            if destination_chat_id:
+                await context.bot.send_message(
+                    chat_id=destination_chat_id,
+                    text="SOURCE_URLS bo'sh. .env da manbalarni kiriting.",
+                )
+            return stats
 
-    for source_url in source_urls:
-        try:
-            listing_resp = requests.get(
-                source_url,
-                timeout=20,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            listing_resp.raise_for_status()
-            candidates = extract_candidate_links(source_url, listing_resp.text)
-        except Exception as exc:
-            logger.warning("Source o'qilmadi: %s | %s", source_url, exc)
-            continue
+        seen_links = load_seen_links()
+        today = datetime.now(tz).date().isoformat()
+        evaluated_count = 0
 
-        stats.candidates_total += len(candidates)
-
-        for candidate_url in candidates:
-            if candidate_url in seen_links:
-                continue
-
-            seen_links.add(candidate_url)
-            stats.checked_total += 1
-
+        for source_url in source_urls:
             try:
-                raw_text = fetch_url_content(candidate_url)
-                result = evaluate_opportunity(
-                    client=client,
-                    model=model,
-                    today=today,
-                    source_url=candidate_url,
-                    raw_text=raw_text,
+                listing_resp = await asyncio.to_thread(
+                    requests.get,
+                    source_url,
+                    timeout=20,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                listing_resp.raise_for_status()
+                candidates = extract_candidate_links(
+                    source_url,
+                    listing_resp.text,
+                    max_links=max_candidates_per_source,
                 )
             except Exception as exc:
-                logger.warning("Candidate tekshirilmadi: %s | %s", candidate_url, exc)
+                logger.warning("Source o'qilmadi: %s | %s", source_url, exc)
                 continue
 
-            if result.eligible and destination_chat_id:
-                stats.eligible_total += 1
+            stats.candidates_total += len(candidates)
+
+            for candidate_url in candidates:
+                if evaluated_count >= scan_max_evaluations:
+                    logger.info("Scan limit reached: %s", scan_max_evaluations)
+                    save_seen_links(seen_links)
+                    return stats
+
+                if candidate_url in seen_links:
+                    continue
+
+                seen_links.add(candidate_url)
+                stats.checked_total += 1
+                evaluated_count += 1
+
                 try:
-                    await context.bot.send_message(
-                        chat_id=destination_chat_id,
-                        text=(
-                            "<b>Auto-scan: mos imkoniyat topildi</b>\n"
-                            f"Manba: {escape(candidate_url)}"
-                        ),
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
+                    raw_text = await asyncio.wait_for(
+                        asyncio.to_thread(fetch_url_content, candidate_url),
+                        timeout=30,
                     )
-                    await context.bot.send_message(
-                        chat_id=destination_chat_id,
-                        text=result.post,
-                        disable_web_page_preview=True,
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            evaluate_opportunity,
+                            client,
+                            model,
+                            today,
+                            candidate_url,
+                            raw_text,
+                        ),
+                        timeout=llm_timeout_seconds,
                     )
                 except Exception as exc:
-                    logger.warning("Auto-scan natija yuborilmadi: %s", exc)
+                    logger.warning("Candidate tekshirilmadi: %s | %s", candidate_url, exc)
+                    continue
 
-    save_seen_links(seen_links)
-    return stats
+                if result.eligible and destination_chat_id:
+                    proof = SpellcheckResult(changed=False, corrected_post=result.post, notes=[])
+                    if enable_spellcheck:
+                        try:
+                            proof = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    spellcheck_post,
+                                    client,
+                                    model,
+                                    result.post,
+                                ),
+                                timeout=llm_timeout_seconds,
+                            )
+                        except Exception as exc:
+                            logger.warning("Spellcheck skip: %s", exc)
+
+                    stats.eligible_total += 1
+                    try:
+                        await context.bot.send_message(
+                            chat_id=destination_chat_id,
+                            text=(
+                                "<b>Auto-scan: mos imkoniyat topildi</b>\n"
+                                f"Manba: {escape(candidate_url)}"
+                            ),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                        await context.bot.send_message(
+                            chat_id=destination_chat_id,
+                            text=(
+                                "Imlo tekshiruvi: "
+                                + ("xatolar tuzatildi" if proof.changed else "xato topilmadi")
+                                + (f"\nIzoh: {'; '.join(proof.notes)}" if proof.notes else "")
+                            ),
+                        )
+                        await context.bot.send_message(
+                            chat_id=destination_chat_id,
+                            text=proof.corrected_post,
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as exc:
+                        logger.warning("Auto-scan natija yuborilmadi: %s", exc)
+
+        save_seen_links(seen_links)
+        return stats
+    finally:
+        if scan_lock.locked():
+            scan_lock.release()
 
 
 async def scan_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -377,6 +629,8 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     model: str = app.bot_data["llm_model"]
     tz: ZoneInfo = app.bot_data["tz"]
     target_chat_id: str | None = app.bot_data.get("target_chat_id")
+    llm_timeout_seconds: int = app.bot_data.get("llm_timeout_seconds", 60)
+    enable_spellcheck: bool = app.bot_data.get("enable_spellcheck", True)
 
     source_url = extract_first_url(text)
     today = datetime.now(tz).date().isoformat()
@@ -384,7 +638,10 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if source_url != "Noma'lum":
         try:
-            fetched_text = fetch_url_content(source_url)
+            fetched_text = await asyncio.wait_for(
+                asyncio.to_thread(fetch_url_content, source_url),
+                timeout=30,
+            )
             if fetched_text:
                 raw_text_for_ai = (
                     f"{text}\n\n"
@@ -397,12 +654,16 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text("URLdan matnni avtomatik olishda xatolik bo'ldi, mavjud matn bilan davom etyapman.")
 
     try:
-        result = evaluate_opportunity(
-            client=client,
-            model=model,
-            today=today,
-            source_url=source_url,
-            raw_text=raw_text_for_ai,
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                evaluate_opportunity,
+                client,
+                model,
+                today,
+                source_url,
+                raw_text_for_ai,
+            ),
+            timeout=llm_timeout_seconds,
         )
     except Exception as exc:
         logger.exception("Tahlilda xatolik")
@@ -414,6 +675,27 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"Natija: {status_line}\n"
         f"Sabab: {result.reason or '—'}"
     )
+
+    proof = SpellcheckResult(changed=False, corrected_post=result.post, notes=[])
+    if result.eligible and enable_spellcheck:
+        try:
+            proof = await asyncio.wait_for(
+                asyncio.to_thread(
+                    spellcheck_post,
+                    client,
+                    model,
+                    result.post,
+                ),
+                timeout=llm_timeout_seconds,
+            )
+            await update.message.reply_text(
+                "Imlo tekshiruvi: "
+                + ("xatolar tuzatildi" if proof.changed else "xato topilmadi")
+                + (f"\nIzoh: {'; '.join(proof.notes)}" if proof.notes else "")
+            )
+        except Exception as exc:
+            logger.warning("Imlo tekshiruvi xatoligi: %s", exc)
+            await update.message.reply_text("Imlo tekshiruv vaqtida xatolik bo'ldi, original post ishlatiladi.")
 
     if target_chat_id:
         from_user = update.effective_user.full_name if update.effective_user else "Noma'lum"
@@ -430,7 +712,15 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if result.eligible:
                 await context.bot.send_message(
                     chat_id=target_chat_id,
-                    text=result.post,
+                    text=(
+                        "Imlo tekshiruvi: "
+                        + ("xatolar tuzatildi" if proof.changed else "xato topilmadi")
+                        + (f"\nIzoh: {'; '.join(proof.notes)}" if proof.notes else "")
+                    ),
+                )
+                await context.bot.send_message(
+                    chat_id=target_chat_id,
+                    text=proof.corrected_post,
                     disable_web_page_preview=True,
                 )
 
@@ -452,6 +742,14 @@ def main() -> None:
     target_chat_id = os.getenv("TARGET_CHAT_ID")
     source_urls = parse_source_urls(os.getenv("SOURCE_URLS"))
     auto_scan_interval_minutes = int(os.getenv("AUTO_SCAN_INTERVAL_MINUTES", "0"))
+    llm_timeout_seconds = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    max_candidates_per_source = int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "8"))
+    scan_max_evaluations = int(os.getenv("SCAN_MAX_EVALUATIONS", "20"))
+    enable_spellcheck = os.getenv("ENABLE_SPELLCHECK", "1").strip().lower() not in {"0", "false", "no"}
+    monthly_schedule = parse_monthly_schedule(os.getenv("MONTHLY_SCHEDULE"))
+    member_usernames = parse_member_usernames(os.getenv("MEMBER_USERNAMES"))
+    daily_reminder_hour = int(os.getenv("DAILY_REMINDER_HOUR", "9"))
+    daily_reminder_minute = int(os.getenv("DAILY_REMINDER_MINUTE", "0"))
 
     tz = ZoneInfo(timezone_name)
     client = Anthropic(api_key=claude_api_key)
@@ -463,9 +761,21 @@ def main() -> None:
     application.bot_data["tz"] = tz
     application.bot_data["target_chat_id"] = target_chat_id
     application.bot_data["source_urls"] = source_urls
+    application.bot_data["llm_timeout_seconds"] = llm_timeout_seconds
+    application.bot_data["max_candidates_per_source"] = max_candidates_per_source
+    application.bot_data["scan_max_evaluations"] = scan_max_evaluations
+    application.bot_data["scan_lock"] = asyncio.Lock()
+    application.bot_data["auto_scan_interval_minutes"] = auto_scan_interval_minutes
+    application.bot_data["enable_spellcheck"] = enable_spellcheck
+    application.bot_data["monthly_schedule"] = monthly_schedule
+    application.bot_data["member_usernames"] = member_usernames
+    application.bot_data["daily_reminder_hour"] = daily_reminder_hour
+    application.bot_data["daily_reminder_minute"] = daily_reminder_minute
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("scan", scan_sources))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("duty", duty_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_message))
 
     if auto_scan_interval_minutes > 0:
@@ -482,10 +792,22 @@ def main() -> None:
                 name="auto-source-scan",
             )
 
+    if monthly_schedule:
+        if application.job_queue is None:
+            logger.warning("JobQueue yo'q. Daily reminder o'chirildi.")
+        else:
+            application.job_queue.run_daily(
+                daily_reminder_job,
+                time=dt_time(hour=daily_reminder_hour, minute=daily_reminder_minute, tzinfo=tz),
+                name="daily-duty-reminder",
+            )
+
     logger.info(
-        "Bot ishga tushdi | source_urls=%s | auto_scan_interval_minutes=%s",
+        "Bot ishga tushdi | source_urls=%s | auto_scan_interval_minutes=%s | schedule_days=%s | spellcheck=%s",
         len(source_urls),
         auto_scan_interval_minutes,
+        len(monthly_schedule),
+        enable_spellcheck,
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

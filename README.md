@@ -51,6 +51,14 @@ Railway'da yangi service oching va repo ulang.
 - `BOT_TIMEZONE` (`Asia/Tashkent`)
 - `SOURCE_URLS` (vergul yoki yangi qatorda source linklar)
 - `AUTO_SCAN_INTERVAL_MINUTES` (masalan `60`, `0` bo'lsa auto off)
+- `LLM_TIMEOUT_SECONDS` (masalan `60`)
+- `MAX_CANDIDATES_PER_SOURCE` (masalan `8`)
+- `SCAN_MAX_EVALUATIONS` (masalan `20`)
+- `ENABLE_SPELLCHECK` (`1` yoki `0`)
+- `MONTHLY_SCHEDULE` (masalan `1:Botirjon,Nargiza;2:Elbek,Muattar`)
+- `MEMBER_USERNAMES` (masalan `Botirjon=@botirjon_uz,Nargiza=@nargiza_uz`)
+- `DAILY_REMINDER_HOUR` (masalan `9`)
+- `DAILY_REMINDER_MINUTE` (masalan `0`)
 
 Start command:
 
@@ -74,5 +82,17 @@ URL rejimi:
 
 Auto source rejimi:
 - `/scan` komandasi: source URL'lardan darhol bir martalik scan qiladi.
+- `/status` komandasi: bot bandmi (`busy`) yoki bo'shmi (`idle`) ko'rsatadi.
+- `/duty` komandasi: bugungi navbatchilar va username mentionlarni ko'rsatadi.
 - `AUTO_SCAN_INTERVAL_MINUTES>0` bo'lsa bot periodik scan ham qiladi.
 - Avval tekshirilgan linklar `seen_links.json` fayliga yoziladi, qayta yubormaydi.
+- Uzoq ishlash va xarajatni boshqarish uchun limit env'lardan foydalaning.
+
+Schedule format:
+- `MONTHLY_SCHEDULE`: `kun:ism,ism;kun:ism,ism`
+- Misol: `3:Botirjon,Nargiza;4:Elbek,Muattar;5:Botirjon,Elbek`
+- `MEMBER_USERNAMES`: `Ism=@username` ko'rinishida yoziladi
+
+Imlo tekshiruvi:
+- Eligible post yuborilishidan oldin bot avtomatik imlo tekshiradi.
+- Natija alohida xabar bo'lib chiqadi: `xatolar tuzatildi` yoki `xato topilmadi`.
