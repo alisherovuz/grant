@@ -7,7 +7,7 @@ from html import escape
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs, unquote, quote_plus
 from zoneinfo import ZoneInfo
 
 import requests
@@ -42,6 +42,92 @@ Return JSON only:
   "notes": ["short note 1", "short note 2"]
 }
 """
+CMS_DRAFT_SYSTEM_PROMPT = """You are a CMS content structuring assistant for an education opportunities website.
+Given program name and multiple source texts/links, create a single structured draft.
+Rules:
+1) Use ONLY facts that appear in sources.
+2) If unsure, use \"UNKNOWN\".
+3) Keep output concise and factual.
+4) All long text fields should be in Uzbek Latin.
+5) For categorical fields, choose ONLY from allowed options below, otherwise \"UNKNOWN\".
+
+Allowed values:
+Imkoniyat turi: To'liq ta'lim, Almashinuv dasturi, Konfrensiya, Yozgi maktab, Til kursi, Volontyorlik, Amaliyot, Work and Travel, Tadqiqot, Malaka oshirish, Xalqaro Musobaqalar, UNKNOWN
+Daraja: Almashinuv (Maktab), Bakalavr, Almashinuv (Bakalavr), Magistratura, PhD, Professional rivojlanish, UNKNOWN
+Moliyalashtirish: To'liq moliyalash, Qisman moliyalash, O'z-o'zini moliyalash, Bepul ishtirok, Stipendiya, UNKNOWN
+Format: Offlayn, Onlayn, Gibrid (Onlayn & Offlayn), UNKNOWN
+Davomiylik: Juda qisqa (1-5 kun), Qisqa (1-3 hafta), O'rta (1-2 oy), Kengaytirilgan (3-9 oy), Uzoq (1-2 yil), Juda uzoq (3+ yil), UNKNOWN
+Ariza to'lovi: Bor, Yo'q, UNKNOWN
+
+Return JSON only with this schema:
+{
+  "title": "",
+  "country": "",
+  "official_link": "",
+  "registration_link": "",
+  "deadline_type": "Regular",
+  "deadline": "",
+  "opening_date": "",
+  "imkoniyat_turi": "",
+  "daraja": "",
+  "moliyalashtirish": "",
+  "format": "",
+  "davomiylik": "",
+  "ariza_tolovi": "",
+  "description": "",
+  "eligibility": "",
+  "benefits": "",
+  "application_process": "",
+  "additional_information": "",
+  "sources": [],
+  "confidence": "high|medium|low",
+  "notes": ""
+}
+"""
+PUBLISH_STATE_KEY = "publish_wizard"
+ALLOWED_UNKNOWN = "UNKNOWN"
+IMKONIYAT_TURI_OPTIONS = {
+    "To'liq ta'lim",
+    "Almashinuv dasturi",
+    "Konfrensiya",
+    "Yozgi maktab",
+    "Til kursi",
+    "Volontyorlik",
+    "Amaliyot",
+    "Work and Travel",
+    "Tadqiqot",
+    "Malaka oshirish",
+    "Xalqaro Musobaqalar",
+    ALLOWED_UNKNOWN,
+}
+DARAJA_OPTIONS = {
+    "Almashinuv (Maktab)",
+    "Bakalavr",
+    "Almashinuv (Bakalavr)",
+    "Magistratura",
+    "PhD",
+    "Professional rivojlanish",
+    ALLOWED_UNKNOWN,
+}
+MOLIYALASHTIRISH_OPTIONS = {
+    "To'liq moliyalash",
+    "Qisman moliyalash",
+    "O'z-o'zini moliyalash",
+    "Bepul ishtirok",
+    "Stipendiya",
+    ALLOWED_UNKNOWN,
+}
+FORMAT_OPTIONS = {"Offlayn", "Onlayn", "Gibrid (Onlayn & Offlayn)", ALLOWED_UNKNOWN}
+DAVOMIYLIK_OPTIONS = {
+    "Juda qisqa (1-5 kun)",
+    "Qisqa (1-3 hafta)",
+    "O'rta (1-2 oy)",
+    "Kengaytirilgan (3-9 oy)",
+    "Uzoq (1-2 yil)",
+    "Juda uzoq (3+ yil)",
+    ALLOWED_UNKNOWN,
+}
+ARIZA_TOLOVI_OPTIONS = {"Bor", "Yo'q", ALLOWED_UNKNOWN}
 
 
 @dataclass
@@ -66,6 +152,12 @@ class SpellcheckResult:
     notes: list[str]
 
 
+@dataclass
+class PublishDraftResult:
+    data: dict[str, Any]
+    used_sources: list[str]
+
+
 def get_required_env(key: str) -> str:
     value = os.getenv(key)
     if not value:
@@ -76,6 +168,12 @@ def get_required_env(key: str) -> str:
 def extract_first_url(text: str) -> str:
     match = re.search(r"https?://\S+", text)
     return match.group(0).rstrip(").,;!?\"]") if match else "Noma'lum"
+
+
+def extract_all_urls(text: str) -> list[str]:
+    urls = re.findall(r"https?://\S+", text or "")
+    cleaned = [u.rstrip(").,;!?\"]") for u in urls]
+    return list(dict.fromkeys(cleaned))
 
 
 def sanitize_text(text: str) -> str:
@@ -139,6 +237,40 @@ def parse_source_urls(raw: str | None) -> list[str]:
         item = chunk.strip()
         if item.startswith("http://") or item.startswith("https://"):
             urls.append(item)
+    return list(dict.fromkeys(urls))
+
+
+def clean_search_result_url(href: str) -> str:
+    href = href.strip()
+    if href.startswith("//"):
+        href = f"https:{href}"
+    if href.startswith("/l/?"):
+        query = parse_qs(urlparse(href).query)
+        if "uddg" in query and query["uddg"]:
+            return unquote(query["uddg"][0])
+    return href
+
+
+def search_program_sources(program_name: str, max_results: int = 6) -> list[str]:
+    query = quote_plus(program_name)
+    search_url = f"https://duckduckgo.com/html/?q={query}"
+    resp = requests.get(
+        search_url,
+        timeout=20,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    urls: list[str] = []
+    for a in soup.select("a.result__a"):
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+        cleaned = clean_search_result_url(href)
+        if cleaned.startswith("http://") or cleaned.startswith("https://"):
+            urls.append(cleaned)
+        if len(urls) >= max_results:
+            break
     return list(dict.fromkeys(urls))
 
 
@@ -334,6 +466,101 @@ def spellcheck_post(client: Anthropic, model: str, post_text: str) -> Spellcheck
     return SpellcheckResult(changed=changed, corrected_post=corrected_post, notes=notes[:3])
 
 
+def normalize_enum(value: str, allowed: set[str]) -> str:
+    value = (value or "").strip()
+    return value if value in allowed else ALLOWED_UNKNOWN
+
+
+def validate_publish_draft(data: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(data)
+    normalized["imkoniyat_turi"] = normalize_enum(str(data.get("imkoniyat_turi", "")), IMKONIYAT_TURI_OPTIONS)
+    normalized["daraja"] = normalize_enum(str(data.get("daraja", "")), DARAJA_OPTIONS)
+    normalized["moliyalashtirish"] = normalize_enum(str(data.get("moliyalashtirish", "")), MOLIYALASHTIRISH_OPTIONS)
+    normalized["format"] = normalize_enum(str(data.get("format", "")), FORMAT_OPTIONS)
+    normalized["davomiylik"] = normalize_enum(str(data.get("davomiylik", "")), DAVOMIYLIK_OPTIONS)
+    normalized["ariza_tolovi"] = normalize_enum(str(data.get("ariza_tolovi", "")), ARIZA_TOLOVI_OPTIONS)
+    normalized["deadline_type"] = str(data.get("deadline_type", "Regular") or "Regular")
+    normalized["sources"] = [str(x) for x in data.get("sources", [])][:12] if isinstance(data.get("sources"), list) else []
+    normalized["confidence"] = str(data.get("confidence", "low") or "low")
+    return normalized
+
+
+def build_publish_preview(draft: dict[str, Any]) -> str:
+    return (
+        "Draft tayyor:\n\n"
+        f"Title: {draft.get('title', '')}\n"
+        f"Country: {draft.get('country', '')}\n"
+        f"Imkoniyat turi: {draft.get('imkoniyat_turi', '')}\n"
+        f"Daraja: {draft.get('daraja', '')}\n"
+        f"Moliyalashtirish: {draft.get('moliyalashtirish', '')}\n"
+        f"Format: {draft.get('format', '')}\n"
+        f"Davomiylik: {draft.get('davomiylik', '')}\n"
+        f"Ariza to'lovi: {draft.get('ariza_tolovi', '')}\n"
+        f"Official link: {draft.get('official_link', '')}\n"
+        f"Registration link: {draft.get('registration_link', '')}\n"
+        f"Deadline: {draft.get('deadline', '')}\n"
+        f"Opening date: {draft.get('opening_date', '')}\n"
+        f"Confidence: {draft.get('confidence', '')}\n\n"
+        f"Description:\n{draft.get('description', '')}\n\n"
+        f"Eligibility:\n{draft.get('eligibility', '')}\n\n"
+        f"Benefits:\n{draft.get('benefits', '')}\n\n"
+        f"Application Process:\n{draft.get('application_process', '')}\n\n"
+        f"Additional Information:\n{draft.get('additional_information', '')}\n\n"
+        "Tasdiqlash: /approve\nBekor qilish: /cancelpublish"
+    )
+
+
+def generate_publish_draft(
+    client: Anthropic,
+    model: str,
+    program_name: str,
+    input_links: list[str],
+    max_sources: int = 8,
+) -> PublishDraftResult:
+    source_candidates = list(dict.fromkeys(input_links + search_program_sources(program_name, max_results=max_sources)))
+    source_candidates = source_candidates[:max_sources]
+
+    collected_chunks: list[str] = []
+    used_sources: list[str] = []
+    for url in source_candidates:
+        try:
+            text = fetch_url_content(url, max_chars=4500)
+        except Exception:
+            continue
+        if not text:
+            continue
+        used_sources.append(url)
+        collected_chunks.append(f"[SOURCE] {url}\n{text}")
+        if len(collected_chunks) >= max_sources:
+            break
+
+    if not collected_chunks:
+        raise ValueError("Hech bir manbadan matn olib bo'lmadi")
+
+    user_payload = (
+        f"Program name: {program_name}\n"
+        f"Seed links: {', '.join(input_links) if input_links else 'none'}\n\n"
+        "Source texts:\n"
+        + "\n\n".join(collected_chunks)
+    )
+
+    response = client.messages.create(
+        model=model,
+        system=CMS_DRAFT_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_payload}],
+        max_tokens=3500,
+        temperature=0,
+    )
+    parts: list[str] = []
+    for block in response.content:
+        if getattr(block, "type", "") == "text":
+            parts.append(getattr(block, "text", ""))
+    parsed = safe_json_extract("\n".join(parts).strip())
+    parsed["sources"] = used_sources
+    validated = validate_publish_draft(parsed)
+    return PublishDraftResult(data=validated, used_sources=used_sources)
+
+
 def format_group_message(result: EvaluationResult, source_url: str, from_user: str) -> tuple[str, str | None]:
     safe_url = escape(source_url)
     safe_user = escape(from_user)
@@ -384,8 +611,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Opportunity matnini yuboring. Bot uni tekshiradi va natijani private guruhga jo'natadi.\n\n"
         "Format erkin: URL + tavsif matni bo'lsa yetarli.\n"
-        "Agar SOURCE_URLS berilgan bo'lsa, /scan komandasi bilan bot manbalarni o'zi skan qiladi."
+        "Agar SOURCE_URLS berilgan bo'lsa, /scan komandasi bilan bot manbalarni o'zi skan qiladi.\n"
+        "Website draft uchun: /publish"
     )
+
+
+async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    context.user_data[PUBLISH_STATE_KEY] = {"step": "awaiting_name"}
+    await update.message.reply_text(
+        "Publishing wizard boshlandi.\n1/2 Program nomini yuboring:"
+    )
+
+
+async def cancel_publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if PUBLISH_STATE_KEY in context.user_data:
+        context.user_data.pop(PUBLISH_STATE_KEY, None)
+    if not update.message:
+        return
+    await update.message.reply_text("Publish wizard bekor qilindi.")
+
+
+async def approve_publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    state = context.user_data.get(PUBLISH_STATE_KEY, {})
+    draft = state.get("draft") if isinstance(state, dict) else None
+    if not draft:
+        await update.message.reply_text("Tasdiqlash uchun draft topilmadi. /publish dan boshlang.")
+        return
+    await update.message.reply_text(
+        "Draft tasdiqlandi. Endi buni website publish API ga ulash qolgan (hozircha manual copy/paste rejim)."
+    )
+    context.user_data.pop(PUBLISH_STATE_KEY, None)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -605,6 +864,67 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if chat_type != "private" and allowed_group_id and chat_id != allowed_group_id:
         return
 
+    publish_state = context.user_data.get(PUBLISH_STATE_KEY)
+    if publish_state:
+        if chat_type != "private":
+            await update.message.reply_text("Publish wizard faqat private chatda ishlaydi.")
+            return
+
+        step = str(publish_state.get("step", ""))
+        incoming = update.message.text.strip()
+
+        if step == "awaiting_name":
+            context.user_data[PUBLISH_STATE_KEY] = {
+                "step": "awaiting_links",
+                "program_name": incoming,
+            }
+            await update.message.reply_text(
+                "2/2 Mavjud linklarni yuboring (bir nechta bo'lsa bo'sh joy yoki yangi qator bilan).\n"
+                "Agar link bo'lmasa: none"
+            )
+            return
+
+        if step == "awaiting_links":
+            program_name = str(publish_state.get("program_name", "")).strip()
+            if not program_name:
+                context.user_data.pop(PUBLISH_STATE_KEY, None)
+                await update.message.reply_text("Program nomi yo'qolib qoldi. /publish ni qayta boshlang.")
+                return
+
+            input_links = [] if incoming.lower() == "none" else extract_all_urls(incoming)
+            await update.message.reply_text("Ko'p manbadan tekshirib draft tayyorlayapman...")
+            try:
+                draft_result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        generate_publish_draft,
+                        client,
+                        model,
+                        program_name,
+                        input_links,
+                    ),
+                    timeout=max(90, llm_timeout_seconds),
+                )
+            except Exception as exc:
+                context.user_data.pop(PUBLISH_STATE_KEY, None)
+                await update.message.reply_text(f"Draft yaratishda xatolik: {exc}\nQayta urinib ko'ring: /publish")
+                return
+
+            context.user_data[PUBLISH_STATE_KEY] = {
+                "step": "ready",
+                "program_name": program_name,
+                "draft": draft_result.data,
+            }
+            await update.message.reply_text(build_publish_preview(draft_result.data), disable_web_page_preview=True)
+            await update.message.reply_text(
+                "Manbalar:\n" + "\n".join(draft_result.used_sources[:12]),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if step == "ready":
+            await update.message.reply_text("Draft tayyor. Tasdiqlash: /approve yoki bekor qilish: /cancelpublish")
+            return
+
     if chat_type != "private":
         if not is_reply_bot_trigger(update, bot_username):
             return
@@ -799,6 +1119,9 @@ def main() -> None:
     application.bot_data["daily_reminder_minute"] = daily_reminder_minute
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("publish", publish_command))
+    application.add_handler(CommandHandler("approve", approve_publish_command))
+    application.add_handler(CommandHandler("cancelpublish", cancel_publish_command))
     application.add_handler(CommandHandler("scan", scan_sources))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("duty", duty_command))

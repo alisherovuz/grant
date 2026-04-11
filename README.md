@@ -105,3 +105,10 @@ Reply orqali grant post:
 Guruh cheklovi:
 - `ALLOWED_GROUP_ID` qo'ysangiz, bot faqat o'sha bitta guruhda ishlaydi.
 - Private chat funksiyalari (bot bilan shaxsiy chat) ishlashda davom etadi.
+
+Publish wizard (website draft):
+- `/publish` yuboring.
+- Bot 2 ta ma'lumot so'raydi: `Program name` va `Existing links`.
+- Bot internetdan qo'shimcha source qidirib, ko'p manbadan bitta draft tuzadi.
+- Draft preview chiqadi, tasdiqlash uchun `/approve`, bekor qilish uchun `/cancelpublish`.
+- Hozircha `/approve` faqat tasdiqlash statusini beradi (CMS API ulanishi keyingi bosqich).
