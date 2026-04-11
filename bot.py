@@ -525,17 +525,29 @@ def generate_publish_draft(
     for url in source_candidates:
         try:
             text = fetch_url_content(url, max_chars=4500)
+            if text:
+                used_sources.append(url)
+                collected_chunks.append(f"[SOURCE] {url}\n{text}")
+                if len(collected_chunks) >= max_sources:
+                    break
+                continue
         except Exception:
-            continue
-        if not text:
-            continue
+            pass
+
+        # Keep the source context even when content extraction fails (e.g. dynamic pages/forms).
         used_sources.append(url)
-        collected_chunks.append(f"[SOURCE] {url}\n{text}")
+        collected_chunks.append(
+            f"[SOURCE] {url}\nCONTENT_UNAVAILABLE_FROM_SCRAPER: "
+            "This page may be dynamic/protected. Use other sources and keep unknowns as UNKNOWN."
+        )
         if len(collected_chunks) >= max_sources:
             break
 
     if not collected_chunks:
-        raise ValueError("Hech bir manbadan matn olib bo'lmadi")
+        collected_chunks.append(
+            "[SOURCE] none\nCONTENT_UNAVAILABLE_FROM_SCRAPER: "
+            "No source text available. Fill only confidently known fields and use UNKNOWN for the rest."
+        )
 
     user_payload = (
         f"Program name: {program_name}\n"
@@ -619,7 +631,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def publish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    context.user_data[PUBLISH_STATE_KEY] = {"step": "awaiting_name"}
+    context.user_data[PUBLISH_STATE_KEY] = {
+        "step": "awaiting_name",
+        "owner_user_id": update.effective_user.id if update.effective_user else None,
+        "chat_id": update.effective_chat.id if update.effective_chat else None,
+    }
     await update.message.reply_text(
         "Publishing wizard boshlandi.\n1/2 Program nomini yuboring:"
     )
@@ -866,8 +882,14 @@ async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     publish_state = context.user_data.get(PUBLISH_STATE_KEY)
     if publish_state:
-        if chat_type != "private":
-            await update.message.reply_text("Publish wizard faqat private chatda ishlaydi.")
+        owner_user_id = publish_state.get("owner_user_id")
+        state_chat_id = publish_state.get("chat_id")
+        current_user_id = update.effective_user.id if update.effective_user else None
+        current_chat_id = update.effective_chat.id if update.effective_chat else None
+
+        if owner_user_id and current_user_id != owner_user_id:
+            return
+        if state_chat_id and current_chat_id != state_chat_id:
             return
 
         step = str(publish_state.get("step", ""))

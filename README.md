@@ -112,3 +112,4 @@ Publish wizard (website draft):
 - Bot internetdan qo'shimcha source qidirib, ko'p manbadan bitta draft tuzadi.
 - Draft preview chiqadi, tasdiqlash uchun `/approve`, bekor qilish uchun `/cancelpublish`.
 - Hozircha `/approve` faqat tasdiqlash statusini beradi (CMS API ulanishi keyingi bosqich).
+- Wizard private chatda ham, guruhda ham ishlaydi (guruhda faqat boshlagan user davom ettira oladi).
