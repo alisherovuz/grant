@@ -143,6 +143,20 @@ class ScanStats:
     candidates_total: int = 0
     checked_total: int = 0
     eligible_total: int = 0
+    sources_failed: int = 0
+
+    def short_summary(self) -> str:
+        """Brief summary for auto-scan finish message."""
+        if self.eligible_total == 0:
+            return (
+                f"🔎 Auto-scan tugadi: {self.checked_total} ta nomzod tekshirildi, "
+                f"yangi imkoniyat topilmadi."
+            )
+        word = "imkoniyat" if self.eligible_total == 1 else "imkoniyatlar"
+        return (
+            f"✅ Auto-scan tugadi: {self.eligible_total} ta yangi {word} topildi "
+            f"({self.checked_total} ta nomzod tekshirildi)."
+        )
 
 
 @dataclass
@@ -672,11 +686,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     auto_scan_interval_minutes = int(context.application.bot_data.get("auto_scan_interval_minutes", 0))
 
     scan_state = "busy (scan ketmoqda)" if scan_lock.locked() else "idle"
-    auto_scan_state = (
-        f"o'chirilgan (oldingi sozlama: {auto_scan_interval_minutes} daqiqa)"
-        if auto_scan_interval_minutes > 0
-        else "o'chirilgan"
-    )
+    if auto_scan_interval_minutes > 0:
+        quiet_start = context.application.bot_data.get("quiet_hours_start", 23)
+        quiet_end = context.application.bot_data.get("quiet_hours_end", 7)
+        auto_scan_state = (
+            f"yoqilgan (har {auto_scan_interval_minutes} daqiqada, "
+            f"jim soatlar {quiet_start:02d}:00-{quiet_end:02d}:00)"
+        )
+    else:
+        auto_scan_state = "o'chirilgan"
 
     await update.message.reply_text(
         "Bot holati:\n"
@@ -786,6 +804,7 @@ async def run_source_scan(context: ContextTypes.DEFAULT_TYPE, notify_chat_id: in
                 )
             except Exception as exc:
                 logger.warning("Source o'qilmadi: %s | %s", source_url, exc)
+                stats.sources_failed += 1
                 continue
 
             stats.candidates_total += len(candidates)
@@ -858,7 +877,49 @@ async def scan_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("Auto-scan o'chirilgan")
+    """Periodic auto-scan job. Skips during quiet hours; sends a brief summary at the end."""
+    app = context.application
+    tz: ZoneInfo = app.bot_data["tz"]
+    target_chat_id: str | None = app.bot_data.get("target_chat_id")
+    quiet_start: int = app.bot_data.get("quiet_hours_start", 23)
+    quiet_end: int = app.bot_data.get("quiet_hours_end", 7)
+
+    now = datetime.now(tz)
+    hour = now.hour
+    # Quiet window can wrap midnight (e.g. start=23, end=7 means 23:00–06:59 is quiet).
+    if quiet_start == quiet_end:
+        in_quiet = False
+    elif quiet_start < quiet_end:
+        in_quiet = quiet_start <= hour < quiet_end
+    else:
+        in_quiet = hour >= quiet_start or hour < quiet_end
+
+    if in_quiet:
+        logger.info("Auto-scan o'tkazib yuborildi (jim soat: %02d:00, oyna %02d-%02d)", hour, quiet_start, quiet_end)
+        return
+
+    if not target_chat_id:
+        logger.warning("Auto-scan skip: TARGET_CHAT_ID yo'q")
+        return
+
+    logger.info("Auto-scan boshlandi (%s)", now.isoformat(timespec="minutes"))
+    try:
+        stats = await run_source_scan(context, notify_chat_id=int(target_chat_id))
+    except Exception as exc:
+        logger.exception("Auto-scan xatolik: %s", exc)
+        return
+
+    # Brief summary at the end — only if we actually scanned anything.
+    if stats.sources_total == 0:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=stats.short_summary(),
+            disable_notification=True,
+        )
+    except Exception as exc:
+        logger.warning("Auto-scan summary yuborilmadi: %s", exc)
 
 
 async def analyze_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1111,6 +1172,8 @@ def main() -> None:
     allowed_group_id = os.getenv("ALLOWED_GROUP_ID")
     source_urls = parse_source_urls(os.getenv("SOURCE_URLS"))
     auto_scan_interval_minutes = int(os.getenv("AUTO_SCAN_INTERVAL_MINUTES", "0"))
+    quiet_hours_start = int(os.getenv("QUIET_HOURS_START", "23"))
+    quiet_hours_end = int(os.getenv("QUIET_HOURS_END", "7"))
     llm_timeout_seconds = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
     max_candidates_per_source = int(os.getenv("MAX_CANDIDATES_PER_SOURCE", "8"))
     scan_max_evaluations = int(os.getenv("SCAN_MAX_EVALUATIONS", "20"))
@@ -1139,6 +1202,8 @@ def main() -> None:
     application.bot_data["member_usernames"] = member_usernames
     application.bot_data["daily_reminder_hour"] = daily_reminder_hour
     application.bot_data["daily_reminder_minute"] = daily_reminder_minute
+    application.bot_data["quiet_hours_start"] = quiet_hours_start
+    application.bot_data["quiet_hours_end"] = quiet_hours_end
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("publish", publish_command))
@@ -1150,7 +1215,23 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_message))
 
     if auto_scan_interval_minutes > 0:
-        logger.info("AUTO_SCAN_INTERVAL_MINUTES=%s lekin auto-scan ataylab o'chirilgan", auto_scan_interval_minutes)
+        if application.job_queue is None:
+            logger.warning("JobQueue yo'q. Auto-scan o'chirildi.")
+        else:
+            interval_seconds = auto_scan_interval_minutes * 60
+            # First run after one full interval, not immediately at startup.
+            application.job_queue.run_repeating(
+                auto_scan_job,
+                interval=interval_seconds,
+                first=interval_seconds,
+                name="auto-scan",
+            )
+            logger.info(
+                "Auto-scan yoqildi: har %s daqiqada, jim soatlar %02d:00-%02d:00",
+                auto_scan_interval_minutes,
+                quiet_hours_start,
+                quiet_hours_end,
+            )
 
     if monthly_schedule:
         if application.job_queue is None:
